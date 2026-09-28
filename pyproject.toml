@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-preview-mcp"
+version = "0.1.0"
+description = "A local MCP server and semantic review interface for project indexes."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.2.0",
+  "pathspec==1.1.1",
+]
+
+[project.scripts]
+project-preview-mcp = "project_preview.cli:main"
+project-preview-ui = "project_preview.ui_cli:main"
+project-preview-export-md = "project_preview.export_markdown:main"
+project-preview-export-map-md = "project_preview.export_map_markdown:main"
+project-preview-export-history-md = "project_preview.export_history_markdown:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+project_preview = ["static/*.html", "static/*.css", "static/*.js"]

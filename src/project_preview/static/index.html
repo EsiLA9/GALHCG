@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="local-ui-token" content="__LOCAL_UI_TOKEN__">
+    <meta name="theme-color" content="#f1f4f2">
+    <title>语义审阅台 · GALHCG</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="语义审阅台首页">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span class="brand-copy"><strong>语义审阅台</strong><small>项目知识索引</small></span>
+        </a>
+        <div class="project-switcher">
+          <label for="project-select">当前项目</label>
+          <select id="project-select" disabled aria-label="选择项目">
+            <option>读取项目中…</option>
+          </select>
+        </div>
+        <div class="top-meta" id="project-meta" aria-live="polite">
+          <span class="meta-dot"></span><span id="project-meta-text">连接本地索引</span>
+        </div>
+        <div class="top-mark">LOCAL <span>READ</span></div>
+      </header>
+
+      <main class="workspace">
+        <aside class="panel navigator" aria-label="概念导航">
+          <div class="panel-heading nav-heading">
+            <div>
+              <p class="eyebrow">PROJECT INDEX</p>
+              <h2>概念目录</h2>
+            </div>
+            <span class="count-badge" id="concept-count">—</span>
+          </div>
+          <div class="search-wrap">
+            <label class="sr-only" for="concept-search">搜索概念或模块</label>
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input id="concept-search" type="search" placeholder="搜索概念、模块…" autocomplete="off" disabled>
+            <kbd>/</kbd>
+          </div>
+          <div class="nav-subline">
+            <span class="section-label" id="tree-scope">项目结构</span>
+            <button class="text-button" id="tree-reload" type="button" disabled>重载</button>
+          </div>
+          <nav id="concept-tree" class="tree-scroll" aria-label="项目概念树">
+            <div class="empty-state compact">
+              <span class="empty-glyph">⌁</span>
+              <p>选择项目后<br>从概念结构开始浏览</p>
+            </div>
+          </nav>
+          <div class="nav-footer">
+            <span class="legend-dot structural"></span>
+            <span>contains 结构</span>
+            <span class="nav-footer-note" id="tree-note">按需展开</span>
+          </div>
+        </aside>
+
+        <section class="panel map-panel" aria-label="局部关系图">
+          <div class="map-toolbar">
+            <div class="map-title-group">
+              <p class="eyebrow">LOCAL GRAPH</p>
+              <h1 id="selected-title">选择一个 Concept</h1>
+              <p class="map-summary" id="selected-summary">沿概念层级定位，再查看局部关系与文件依据。</p>
+            </div>
+            <div class="view-switch" role="tablist" aria-label="关系图视图">
+              <button class="view-tab active" id="view-hierarchy" type="button" role="tab" aria-selected="true" data-view="hierarchy">概念层级</button>
+              <button class="view-tab" id="view-files" type="button" role="tab" aria-selected="false" data-view="files">文件映射</button>
+            </div>
+          </div>
+          <div class="graph-controls" aria-label="图形显示设置">
+            <label for="graph-spacing">节点间距</label>
+            <select id="graph-spacing" aria-label="节点间距">
+              <option value="roomy">宽松</option>
+              <option value="spacious">舒展</option>
+              <option value="wide">大间距</option>
+            </select>
+            <span class="control-divider" aria-hidden="true"></span>
+            <label for="graph-card-mode">卡片文字</label>
+            <select id="graph-card-mode" aria-label="卡片文字显示方式">
+              <option value="wrap">完整换行</option>
+              <option value="fixed">固定尺寸 · 超出省略</option>
+            </select>
+          </div>
+          <div class="graph-legend" id="graph-legend">
+            <span><i class="legend-line contains"></i>结构分解</span>
+            <span class="graph-scope" id="graph-scope">局部 · 最多 2 层</span>
+          </div>
+          <div class="graph-stage" id="graph-stage" aria-live="polite">
+            <svg class="graph-links" id="graph-links" aria-hidden="true"></svg>
+            <div class="graph-nodes" id="graph-nodes">
+              <div class="graph-empty">
+                <div class="map-glyph" aria-hidden="true"><span></span><span></span><span></span></div>
+                <strong>从一个概念开始</strong>
+                <p>这里显示当前概念附近的结构与文件映射。</p>
+              </div>
+            </div>
+          </div>
+          <div class="graph-status" id="graph-status" aria-live="polite">
+            <span id="graph-completeness">尚未载入关系</span>
+            <button class="text-button" id="graph-more" type="button" hidden>继续载入</button>
+          </div>
+        </section>
+
+        <aside class="panel inspector" aria-label="概念与文件检查器">
+          <div class="inspector-scroll" id="inspector-scroll">
+            <div class="inspector-empty" id="inspector-empty">
+              <div class="empty-stamp" aria-hidden="true">R</div>
+              <p class="eyebrow">REVIEW PANEL</p>
+              <h2>检查器</h2>
+              <p>选择概念或文件，查看摘要、关联和当前记录信息。</p>
+            </div>
+
+            <div id="project-inspector" hidden>
+              <div class="inspect-head">
+                <div class="inspect-type-row"><span class="type-mark">PROJECT</span><span class="state-pill">当前范围</span></div>
+                <h2 id="project-inspector-name">项目</h2>
+                <code class="project-root" id="project-root">—</code>
+              </div>
+              <section class="inspect-section">
+                <div class="section-heading"><h3>索引范围</h3></div>
+                <dl class="record-grid" id="project-overview-meta"></dl>
+              </section>
+              <section class="inspect-section">
+                <div class="section-heading"><h3>概念图覆盖</h3></div>
+                <p class="node-summary" id="project-coverage-note">这里显示已建立的语义关联范围；文件覆盖不代表理解准确率。</p>
+                <dl class="record-grid" id="project-coverage-meta"></dl>
+              </section>
+            </div>
+
+            <div id="concept-inspector" hidden>
+              <div class="inspect-head">
+                <div class="inspect-type-row">
+                  <span class="type-mark" id="node-type">CONCEPT</span>
+                  <span class="state-pill" id="node-state">—</span>
+                </div>
+                <h2 id="node-name">—</h2>
+                <div class="alias-row" id="node-aliases"></div>
+              </div>
+
+              <section class="inspect-section summary-section">
+                <div class="section-heading"><h3>压缩摘要</h3></div>
+                <p class="node-summary" id="node-summary">—</p>
+              </section>
+
+              <section class="inspect-section">
+                <div class="section-heading"><h3>当前记录信息</h3></div>
+                <dl class="record-grid" id="node-times"></dl>
+              </section>
+
+              <section class="inspect-section">
+                <div class="section-heading"><h3>关联文件</h3><span class="section-count" id="association-count">0</span></div>
+                <p class="section-hint">实现、文档或测试的导航关系</p>
+                <div class="file-list" id="association-list"></div>
+              </section>
+
+              <section class="inspect-section evidence-section">
+                <div class="section-heading"><h3>文件级依据</h3><span class="section-count" id="evidence-count">0</span></div>
+                <p class="section-hint">这些文件版本支撑当前摘要；不表示精确代码位置。</p>
+                <div class="evidence-list" id="evidence-list"></div>
+                <div class="evidence-footer" id="evidence-footer"></div>
+                <button class="verify-button" id="verify-button" type="button" disabled>
+                  <span class="verify-symbol" aria-hidden="true">↻</span>
+                  <span>重新核验依据</span>
+                </button>
+                <p class="verify-note" id="verify-note">仅更新该 Concept 的最近核验观察。</p>
+              </section>
+
+              <section class="inspect-section other-relations" id="other-relations-section" hidden>
+                <div class="section-heading"><h3>其他概念关系</h3><span class="section-count" id="other-relations-count">0</span></div>
+                <div id="other-relations-list"></div>
+              </section>
+            </div>
+
+            <section class="source-inspector" id="source-inspector" hidden>
+              <div class="source-heading">
+                <div class="section-heading"><h3>原文预览</h3><span class="file-kind" id="source-kind">FILE</span></div>
+                <code id="source-path">—</code>
+              </div>
+              <dl class="source-meta" id="source-meta"></dl>
+              <div class="source-actions">
+                <button class="quiet-button" id="source-head" type="button">文件头</button>
+                <button class="quiet-button" id="source-tail" type="button">文件尾</button>
+                <button class="quiet-button" id="source-open" type="button">系统编辑器</button>
+              </div>
+              <form class="file-search" id="file-search-form">
+                <label class="sr-only" for="file-search-query">在当前文件中搜索</label>
+                <input id="file-search-query" type="search" placeholder="在当前文件中查找…" autocomplete="off">
+                <button type="submit" aria-label="搜索文件">查找</button>
+              </form>
+              <div class="search-hits" id="search-hits" hidden></div>
+              <div class="preview-status" id="preview-status" aria-live="polite"></div>
+              <pre class="source-lines" id="source-lines" tabindex="0"><code>选择依据文件后显示分页源码。</code></pre>
+              <div class="preview-footer">
+                <span id="preview-range">—</span>
+                <button class="text-button" id="preview-next" type="button" hidden>下一页 →</button>
+              </div>
+              <button class="source-close" id="source-close" type="button">关闭文件预览</button>
+            </section>
+          </div>
+          <div class="inspector-rail" aria-hidden="true"><span></span></div>
+        </aside>
+      </main>
+
+      <footer class="app-footer">
+        <span>本地语义地图</span>
+        <span class="footer-divider"></span>
+        <span id="footer-scope">结果仅覆盖当前查询范围</span>
+        <span class="footer-right">GALHCG <b>·</b> LOCAL</span>
+      </footer>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+  </body>
+</html>
