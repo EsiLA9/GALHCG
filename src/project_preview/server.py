@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
@@ -26,16 +28,26 @@ def make_server(
     server = MCPServer(
         "project-preview-mcp",
         instructions=(
-            "只访问启动参数 --root 或 --project 指定的本地项目。多项目配置时，"
+            "面向本机 Coding Agent 与本地语义审阅界面使用。访问范围由启动参数 --root 或 --project 注册的项目根目录决定；"
+            "project_id 用于选择项目及其数据库命名空间，不是用户角色或登录权限。多项目配置时，"
             "browse、preview、search、refresh、refresh_history 和 list_files 必须提供 project_id；"
             "单项目配置可省略。status 可传 project_id 查询一个项目，省略时汇总所有项目。"
             "所有工具路径都相对于所选项目根目录。refresh 写入文件元数据清单，"
             "不会保存源码正文；refresh_history 返回可分页的持久化运行记录和扫描统计。"
             "update_map 只写入 Module/Concept 语义节点和允许类型的关系；"
             "context 返回有完整性标记的局部结构与依据新鲜度；traverse 用于有界多跳路径探索。"
+            "review_changes 只读检查有直接语义引用的文件版本，返回变化状态和直接 Evidence/maps_to 邻接，不扩展 Concept 多跳；"
+            "verify_freshness 是单独的显式操作，会将一个节点或关系的最新核验观察写入派生状态。"
             "resolve_paths 可按项目根目录下的精确路径解析 File 节点 ID。confirmed 写入必须提交 preview 返回的 version_token。"
+            "resolve_project 可根据调用方显式提供的绝对工作目录匹配已注册项目根；它不会读取客户端当前目录，也不会改变后续工具的项目选择，调用方仍应传返回的 project_id。"
+            "MCP 与本地审阅界面省略 --data-dir 时使用相同的当前用户默认目录；如使用自定义目录，两边传入同一个 --data-dir 即可，无需另设环境变量。"
         ),
     )
+
+    @server.tool()
+    def resolve_project(workspace_path: str) -> dict[str, Any]:
+        """按调用方显式传入的绝对工作目录匹配已配置项目；不读取 MCP 客户端 cwd、不注册项目，也不改变后续调用的 project_id。匹配后请在后续工具中显式传回结果的 project_id。"""
+        return _resolve_project_by_workspace_path(index, workspace_path)
 
     @server.tool()
     def browse(
@@ -73,7 +85,7 @@ def make_server(
         project_id: str | None = None,
         node_types: list[str] | None = None,
     ) -> dict[str, Any]:
-        """按路径片段、源码字面量或语义地图名称/别名/摘要搜索。path/source query 最多 512 字符；map 最多 256 字符且默认区分大小写。map 不接受 directory/context_lines，可用 node_types 筛选节点类型。"""
+        """搜索 path、source 或 map。path 按路径片段查找，source 搜源码字面量；map 查节点名称、别名和摘要，未筛选时也可能返回 File。只看概念时传 node_types=["Concept"]；map 不接受 directory/context_lines。path/source 查询最多 512 字符，map 最多 256 字符；搜索可能受预算截断，检查完整性字段并按提示缩小范围。"""
         selected = _select_project(index, project_id)
         if isinstance(selected, dict):
             return selected
@@ -125,6 +137,42 @@ def make_server(
         return index.status(project_id, limit=limit, offset=offset)
 
     @server.tool()
+    def review_changes(
+        directory: str = "",
+        path: str = "",
+        limit: int = 20,
+        offset: int = 0,
+        owner_offset: int = 0,
+        owner_limit: int = 5,
+        include_unchanged: bool = False,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """只读复核项目中有直接 Evidence 或 maps_to 关联的文件。version_token 用于确认内容变化，mtime 仅作元数据线索。每页最多检查 20 个文件、每文件展示 5 个直接 owner；用 next_offset 和 owner_next_offset 续读。path 与 directory 不能同时指定。查询不会刷新文件清单、写入 freshness 或修改语义图。"""
+        selected = _select_project(index, project_id)
+        if isinstance(selected, dict):
+            return selected
+        selected_id, _project = selected
+        return index.review_changes(
+            selected_id,
+            directory=directory,
+            path=path,
+            limit=limit,
+            offset=offset,
+            owner_offset=owner_offset,
+            owner_limit=owner_limit,
+            include_unchanged=include_unchanged,
+        )
+
+    @server.tool()
+    def verify_freshness(owner_type: str, owner_id: str, project_id: str | None = None) -> dict[str, Any]:
+        """显式重查一个语义节点或关系的 Evidence，并写入其最新 freshness 观察；不会改动节点、关系或 Evidence。"""
+        selected = _select_project(index, project_id)
+        if isinstance(selected, dict):
+            return selected
+        selected_id, _project = selected
+        return index.verify_freshness(selected_id, owner_type, owner_id)
+
+    @server.tool()
     def list_files(
         directory: str = "",
         limit: int = 100,
@@ -132,7 +180,7 @@ def make_server(
         include_directories: bool = False,
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        """查询上次成功刷新的持久化清单，按相对路径稳定排序并分页。"""
+        """查询上次成功刷新的持久化清单，按相对路径稳定排序并分页。输出预算可能使实际条数少于 limit；始终按响应的 next_offset 续读，直到 next_offset 为 null，不要按请求 limit 自行递增。"""
         selected = _select_project(index, project_id)
         if isinstance(selected, dict):
             return selected
@@ -154,7 +202,7 @@ def make_server(
         project_id: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """原子新增/修改/删除语义节点和关系；dry_run=true 可预检并回滚，不会保存批准票据。confirmed 节点必须附 preview 令牌对应的文件依据。"""
+        """原子新增/修改/删除语义节点和关系。节点字段：id/type/name/summary/aliases/state/evidence；type 仅 Module 或 Concept，state 仅 tentative 或 confirmed（字段名是 state，不是 status）。边字段：source_id/relation/target_id/evidence；relation 为 contains/maps_to/depends_on/related_to，maps_to 可带 roles（implementation/documentation/test/unspecified）。依据项严格为 {path, version_token}，令牌来自 preview。confirmed 节点须带依据。每次 update_map 合计最多校验 32 条节点与边依据，同一路径由不同 owner 引用仍分别计数；超限时拆分批次。先用 dry_run=true 预检，再提交正式批次。"""
         selected = _select_project(index, project_id)
         if isinstance(selected, dict):
             return selected
@@ -221,6 +269,96 @@ def make_server(
         return index.resolve_paths(selected_id, paths)
 
     return server
+
+
+def _resolve_project_by_workspace_path(
+    index: ProjectIndex, workspace_path: str
+) -> dict[str, Any]:
+    if not isinstance(workspace_path, str) or not workspace_path.strip() or "\x00" in workspace_path:
+        return {
+            "ok": False,
+            "error": "invalid_workspace_path",
+            "message": "workspace_path 必须是非空的绝对目录路径。",
+        }
+    try:
+        supplied_path = Path(workspace_path).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        return {
+            "ok": False,
+            "error": "invalid_workspace_path",
+            "message": "workspace_path 无法解析为本机目录路径。",
+        }
+    if not supplied_path.is_absolute():
+        return {
+            "ok": False,
+            "error": "workspace_path_not_absolute",
+            "message": "workspace_path 必须是绝对路径；请传入 Agent 的项目工作目录。",
+        }
+    try:
+        resolved_path = supplied_path.resolve(strict=True)
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "workspace_path_not_found",
+            "message": "workspace_path 不存在，请检查 Agent 当前工作目录。",
+        }
+    except (OSError, RuntimeError, ValueError):
+        return {
+            "ok": False,
+            "error": "workspace_path_unavailable",
+            "message": "workspace_path 无法解析；请检查路径或符号链接。",
+        }
+    if not resolved_path.is_dir():
+        return {
+            "ok": False,
+            "error": "workspace_path_not_directory",
+            "message": "workspace_path 必须指向目录。",
+        }
+
+    matches: list[tuple[int, str, str]] = []
+    for project_id, project in index.projects.items():
+        root_path = project.root
+        try:
+            common_path = os.path.commonpath((str(resolved_path), str(root_path)))
+        except ValueError:
+            # Windows paths on different drives do not share a common path.
+            continue
+        if os.path.normcase(os.path.normpath(common_path)) != os.path.normcase(os.path.normpath(str(root_path))):
+            continue
+        matches.append((len(root_path.parts), project_id, str(root_path)))
+
+    if not matches:
+        return {
+            "ok": False,
+            "error": "workspace_not_configured",
+            "message": "Agent 工作目录不在任何已配置项目根目录内；请将其映射到服务已登记的项目。",
+            "workspace_path": str(resolved_path),
+            "available_project_ids": index.project_ids(),
+        }
+
+    deepest_root = max(depth for depth, _project_id, _root in matches)
+    best_matches = [match for match in matches if match[0] == deepest_root]
+    if len(best_matches) != 1:
+        return {
+            "ok": False,
+            "error": "ambiguous_workspace_path",
+            "message": "此工作目录匹配多个同等深度的已配置项目；请显式选择 project_id。",
+            "workspace_path": str(resolved_path),
+            "candidates": [
+                {"project_id": project_id, "root_path": root_path}
+                for _depth, project_id, root_path in best_matches
+            ],
+        }
+
+    _depth, project_id, root_path = best_matches[0]
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "root_path": root_path,
+        "workspace_path": str(resolved_path),
+        "match_type": "project_root" if os.path.normcase(root_path) == os.path.normcase(str(resolved_path)) else "subdirectory",
+        "selection_is_persistent": False,
+    }
 
 
 def _select_project(

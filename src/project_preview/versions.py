@@ -20,6 +20,8 @@ class VersionResult:
     token: str | None
     reason: str | None
     bytes_hashed: int
+    mtime_ns: int | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,14 @@ def read_versioned_snapshot(
             if time.monotonic() - started > max_seconds:
                 raise VersionUnavailable("hash_timeout", "读取预览快照超过时间预算，未生成版本凭据。")
             token = make_version_token(secret, project_id, relative_path, digest.digest())
-            return SnapshotResult(content, VersionResult(token, None, len(content)))
+            return SnapshotResult(
+                content,
+                VersionResult(
+                    token, None, len(content),
+                    int(getattr(path_after, "st_mtime_ns", int(path_after.st_mtime * 1_000_000_000))),
+                    int(path_after.st_size),
+                ),
+            )
     except VersionUnavailable as exc:
         return SnapshotResult(None, VersionResult(None, exc.reason, len(content)))
     except OSError:
@@ -200,7 +209,9 @@ def hash_file_version(
             if time.monotonic() - started > max_seconds:
                 raise VersionUnavailable("hash_timeout", "文件哈希超过时间预算，未生成版本凭据。")
             return VersionResult(
-                make_version_token(secret, project_id, relative_path, first_digest), None, bytes_hashed
+                make_version_token(secret, project_id, relative_path, first_digest), None, bytes_hashed,
+                int(getattr(path_after, "st_mtime_ns", int(path_after.st_mtime * 1_000_000_000))),
+                int(path_after.st_size),
             )
     except VersionUnavailable as exc:
         return VersionResult(None, exc.reason, bytes_hashed)

@@ -175,10 +175,14 @@ class ProjectIndex:
             result["version_token"] = version.token
             result["version_token_status"] = "available"
             result["version_token_reason"] = None
+            result["source_mtime_ns"] = version.mtime_ns
+            result["source_size"] = version.size
         else:
             result["version_token"] = None
             result["version_token_status"] = "unavailable"
             result["version_token_reason"] = version.reason if version and version.reason else "unavailable"
+            result["source_mtime_ns"] = None
+            result["source_size"] = None
         lines = result.get("lines", [])
         while lines and project._json_size(result) > MAX_PREVIEW_OUTPUT_BYTES:
             lines.pop()
@@ -240,6 +244,9 @@ class ProjectIndex:
 
     def verify_freshness(self, project_id: str, owner_type: str, owner_id: str) -> dict[str, Any]:
         return self.semantic_map.verify_freshness(project_id, owner_type, owner_id)
+
+    def review_changes(self, project_id: str, **options: Any) -> dict[str, Any]:
+        return self.semantic_map.review_changes(project_id, **options)
 
     def traverse(self, project_id: str, start_node_id: str, **options: Any) -> dict[str, Any]:
         return self.semantic_map.traverse(project_id, start_node_id, **options)

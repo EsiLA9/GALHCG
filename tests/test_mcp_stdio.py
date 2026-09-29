@@ -44,7 +44,7 @@ class StdioMCPTests(unittest.IsolatedAsyncioTestCase):
                 listed_tools = await client.list_tools()
                 self.assertEqual(
                     {tool.name for tool in listed_tools.tools},
-                    {"browse", "preview", "search", "refresh", "refresh_history", "status", "list_files", "update_map", "context", "traverse", "resolve_paths"},
+                    {"resolve_project", "browse", "preview", "search", "refresh", "refresh_history", "status", "review_changes", "verify_freshness", "list_files", "update_map", "context", "traverse", "resolve_paths"},
                 )
 
                 refresh_result = await client.call_tool("refresh", {})
@@ -88,6 +88,8 @@ class StdioMCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(preview["lines"], [{"line_number": 2, "content": "第二行"}])
                 self.assertEqual(preview["version_token_status"], "available")
                 self.assertRegex(preview["version_token"], r"^v1\.[A-Za-z0-9_-]{43}$")
+                self.assertIsInstance(preview["source_mtime_ns"], int)
+                self.assertEqual(preview["source_size"], source.stat().st_size)
 
                 update_payload = {
                     "project_id": "default",
@@ -139,6 +141,19 @@ class StdioMCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(context["ok"], context)
                 self.assertEqual(context["files"][0]["path"], "src/main.py")
                 self.assertEqual(context["neighbors"][0]["roles"], ["implementation"])
+                change_review = _tool_data(await client.call_tool(
+                    "review_changes", {"project_id": "default", "path": "src/main.py", "include_unchanged": True}
+                ))
+                self.assertTrue(change_review["read_only"])
+                self.assertEqual(change_review["entries"][0]["status"], "unchanged")
+                mapping_owner = next(owner for owner in change_review["entries"][0]["owners"] if owner["owner_type"] == "maps_to")
+                self.assertEqual(mapping_owner["direction"], "Concept → File")
+                verified = _tool_data(await client.call_tool(
+                    "verify_freshness", {
+                        "project_id": "default", "owner_type": "node", "owner_id": "concept:stdio-entry",
+                    }
+                ))
+                self.assertEqual(verified["freshness"]["status"], "fresh")
                 traverse_result = await client.call_tool(
                     "traverse", {
                         "project_id": "default", "start_node_id": "concept:stdio-entry",

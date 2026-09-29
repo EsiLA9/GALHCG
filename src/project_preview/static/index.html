@@ -22,6 +22,7 @@
             <option>读取项目中…</option>
           </select>
         </div>
+        <button class="quiet-button changes-open" id="changes-open" type="button" disabled>文件变化</button>
         <div class="top-meta" id="project-meta" aria-live="polite">
           <span class="meta-dot"></span><span id="project-meta-text">连接本地索引</span>
         </div>
@@ -45,7 +46,10 @@
           </div>
           <div class="nav-subline">
             <span class="section-label" id="tree-scope">项目结构</span>
-            <button class="text-button" id="tree-reload" type="button" disabled>重载</button>
+            <div class="nav-actions">
+              <button class="text-button" id="tree-refresh" type="button" disabled>扫描文件</button>
+              <button class="text-button" id="tree-reload" type="button" disabled>重载</button>
+            </div>
           </div>
           <nav id="concept-tree" class="tree-scroll" aria-label="项目概念树">
             <div class="empty-state compact">
@@ -68,8 +72,9 @@
               <p class="map-summary" id="selected-summary">沿概念层级定位，再查看局部关系与文件依据。</p>
             </div>
             <div class="view-switch" role="tablist" aria-label="关系图视图">
-              <button class="view-tab active" id="view-hierarchy" type="button" role="tab" aria-selected="true" data-view="hierarchy">概念层级</button>
-              <button class="view-tab" id="view-files" type="button" role="tab" aria-selected="false" data-view="files">文件映射</button>
+              <button class="view-tab active" id="view-hierarchy" type="button" role="tab" aria-selected="true" data-view="structure">结构</button>
+              <button class="view-tab" id="view-relations" type="button" role="tab" aria-selected="false" data-view="relations">关系</button>
+              <button class="view-tab" id="view-files" type="button" role="tab" aria-selected="false" data-view="files">文件</button>
             </div>
           </div>
           <div class="graph-controls" aria-label="图形显示设置">
@@ -85,9 +90,24 @@
               <option value="wrap">完整换行</option>
               <option value="fixed">固定尺寸 · 超出省略</option>
             </select>
+            <button class="text-button graph-depth-toggle" id="graph-depth-toggle" type="button">展开两层</button>
+          </div>
+          <div class="relation-controls" id="relation-controls" aria-label="关系图筛选" hidden>
+            <span class="section-label">关系</span>
+            <label><input id="relation-depends" type="checkbox" checked>依赖</label>
+            <label><input id="relation-related" type="checkbox" checked>相关</label>
+            <label><input id="relation-contains" type="checkbox">结构</label>
+            <label class="direction-control" for="graph-direction">有向边方向
+              <select id="graph-direction" aria-label="关系方向">
+                <option value="both">双向</option>
+                <option value="outgoing">当前节点指向</option>
+                <option value="incoming">指向当前节点</option>
+              </select>
+            </label>
+            <span class="relation-help">“相关”关系始终按无向显示</span>
           </div>
           <div class="graph-legend" id="graph-legend">
-            <span><i class="legend-line contains"></i>结构分解</span>
+            <span id="graph-legend-lines"><i class="legend-line contains"></i>结构分解</span>
             <span class="graph-scope" id="graph-scope">局部 · 最多 2 层</span>
           </div>
           <div class="graph-stage" id="graph-stage" aria-live="polite">
@@ -129,6 +149,8 @@
                 <div class="section-heading"><h3>概念图覆盖</h3></div>
                 <p class="node-summary" id="project-coverage-note">这里显示已建立的语义关联范围；文件覆盖不代表理解准确率。</p>
                 <dl class="record-grid" id="project-coverage-meta"></dl>
+                <p class="section-hint relation-count-label">数据库关系按类型计数</p>
+                <div class="relation-counts" id="relation-counts"></div>
               </section>
             </div>
 
@@ -179,7 +201,7 @@
             <section class="source-inspector" id="source-inspector" hidden>
               <div class="source-heading">
                 <div class="section-heading"><h3>原文预览</h3><span class="file-kind" id="source-kind">FILE</span></div>
-                <code id="source-path">—</code>
+                <code id="source-path" tabindex="-1" aria-label="当前预览文件路径">—</code>
               </div>
               <dl class="source-meta" id="source-meta"></dl>
               <div class="source-actions">
@@ -214,5 +236,30 @@
       </footer>
       <div class="toast" id="toast" role="status" aria-live="polite"></div>
     </div>
+    <dialog class="changes-dialog" id="changes-dialog" aria-labelledby="changes-title">
+      <section class="changes-sheet">
+        <header class="changes-header">
+          <div>
+            <p class="eyebrow">FILE CHANGE REVIEW</p>
+            <h2 id="changes-title">文件变化</h2>
+          </div>
+          <button class="graph-file-preview-close" id="changes-close" type="button" aria-label="关闭文件变化清单">×</button>
+        </header>
+        <p class="changes-intro">只检查语义图直接引用的文件。内容令牌确认变化；修改时间只作为线索。</p>
+        <form class="changes-filters" id="changes-form">
+          <label for="changes-directory">项目目录</label>
+          <input id="changes-directory" type="text" placeholder="留空表示整个项目" autocomplete="off">
+          <label class="changes-include"><input id="changes-include-unchanged" type="checkbox">也显示未变化文件</label>
+          <button class="quiet-button" id="changes-run" type="submit">检查文件变化</button>
+        </form>
+        <div class="changes-status" id="changes-status" aria-live="polite">尚未检查文件。</div>
+        <div class="changes-summary" id="changes-summary" hidden></div>
+        <div class="changes-list" id="changes-list"></div>
+        <div class="changes-footer">
+          <span id="changes-page-note">结果只覆盖当前查询范围。</span>
+          <button class="text-button" id="changes-next" type="button" hidden>继续检查 →</button>
+        </div>
+      </section>
+    </dialog>
   </body>
 </html>

@@ -102,6 +102,117 @@ class SemanticMapTests(unittest.TestCase):
         self.assertEqual(reopened.context("alpha", "concept:login")["evidence"][0]["path"], "src/auth.py")
         self.assertEqual(reopened.search_map("alpha", "credentials")["results"][0]["id"], "concept:login")
 
+    def test_review_changes_tracks_capture_metadata_and_is_read_only(self) -> None:
+        source = self.root_a / "src" / "auth.py"
+        token = self.token()
+        preview = self.index.preview("alpha", "src/auth.py")
+        file_id = self.file_id("alpha")
+        saved = self.index.update_map(
+            "alpha",
+            upsert_nodes=[
+                self.semantic_node(
+                    "concept:review-primary", "Concept", "Primary review", state="confirmed",
+                    evidence=[{"path": "src/auth.py", "version_token": token}],
+                ),
+                self.semantic_node("concept:review-navigation", "Concept", "Navigation only"),
+            ],
+            upsert_edges=[
+                {"source_id": "concept:review-primary", "relation": "maps_to", "target_id": file_id,
+                 "evidence": [{"path": "src/auth.py", "version_token": token}]},
+                {"source_id": "concept:review-navigation", "relation": "maps_to", "target_id": file_id},
+            ],
+        )
+        self.assertTrue(saved["ok"], saved)
+        with self.store._connection() as connection:
+            node_capture = connection.execute(
+                "SELECT captured_mtime_ns,captured_size FROM node_evidence "
+                "WHERE project_id='alpha' AND node_id='concept:review-primary'"
+            ).fetchone()
+            edge_capture = connection.execute(
+                "SELECT captured_mtime_ns,captured_size FROM edge_evidence WHERE project_id='alpha'"
+            ).fetchone()
+            freshness_before = connection.execute("SELECT COUNT(*) FROM node_freshness").fetchone()[0]
+        self.assertEqual(node_capture["captured_mtime_ns"], preview["source_mtime_ns"])
+        self.assertEqual(node_capture["captured_size"], preview["source_size"])
+        self.assertIsNotNone(edge_capture["captured_mtime_ns"])
+
+        reviewed = self.index.review_changes("alpha", path="src/auth.py", include_unchanged=True, owner_limit=20)
+        self.assertTrue(reviewed["ok"], reviewed)
+        self.assertTrue(reviewed["read_only"])
+        self.assertEqual(reviewed["entries"][0]["status"], "unchanged")
+        self.assertEqual(reviewed["entries"][0]["owner_total"], 4)
+        mappings = [owner for owner in reviewed["entries"][0]["owners"] if owner["owner_type"] == "maps_to"]
+        self.assertEqual(len(mappings), 2)
+        self.assertTrue(all(owner["direction"] == "Concept → File" for owner in mappings))
+        self.assertTrue(all(owner["status"] == "navigation_only" for owner in mappings))
+        mapping_evidence = [owner for owner in reviewed["entries"][0]["owners"]
+                            if owner["owner_type"] == "edge" and owner["relation"] == "maps_to"]
+        self.assertEqual(len(mapping_evidence), 1)
+        self.assertEqual(mapping_evidence[0]["direction"], "Concept → File")
+        with self.store._connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM node_freshness").fetchone()[0], freshness_before)
+
+        original_stat = source.stat()
+        os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 50_000_000))
+        metadata_only = self.index.review_changes("alpha", path="src/auth.py", include_unchanged=True)
+        self.assertEqual(metadata_only["entries"][0]["status"], "metadata_only")
+        self.assertEqual(metadata_only["entries"][0]["stale_evidence_reference_count"], 0)
+        self.assertTrue(all(
+            owner["status"] == "metadata_only"
+            for owner in metadata_only["entries"][0]["owners"] if owner["owner_type"] != "maps_to"
+        ))
+
+        before_change = source.stat()
+        original = source.read_bytes()
+        changed = original.replace(b"login", b"logon")
+        self.assertEqual(len(original), len(changed))
+        source.write_bytes(changed)
+        os.utime(source, ns=(before_change.st_atime_ns, before_change.st_mtime_ns))
+        changed_report = self.index.review_changes("alpha", path="src/auth.py", include_unchanged=True)
+        self.assertEqual(changed_report["entries"][0]["status"], "content_changed")
+        self.assertGreater(changed_report["entries"][0]["stale_evidence_reference_count"], 0)
+        statuses = {owner["status"] for owner in changed_report["entries"][0]["owners"] if owner["owner_type"] != "maps_to"}
+        self.assertEqual(statuses, {"content_changed"})
+
+    def test_review_changes_bounds_map_only_adjacency_and_reports_refresh_baseline(self) -> None:
+        file_id = self.file_id("alpha")
+        nodes = [self.semantic_node(f"concept:map-only-{i}", "Concept", f"Map only {i}") for i in range(7)]
+        edges = [
+            {"source_id": node["id"], "relation": "maps_to", "target_id": file_id,
+             "roles": ["implementation"]}
+            for node in nodes
+        ]
+        saved = self.index.update_map("alpha", upsert_nodes=nodes, upsert_edges=edges)
+        self.assertTrue(saved["ok"], saved)
+        source = self.root_a / "src" / "auth.py"
+        original_stat = source.stat()
+        os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 60_000_000))
+
+        first_page = self.index.review_changes("alpha", include_unchanged=False)
+        self.assertTrue(first_page["ok"], first_page)
+        entry = first_page["entries"][0]
+        self.assertEqual(entry["status"], "metadata_since_refresh")
+        self.assertEqual(entry["evidence_reference_count"], 0)
+        self.assertEqual(entry["maps_to_count"], 7)
+        self.assertEqual(entry["owner_total"], 7)
+        self.assertEqual(len(entry["owners"]), 5)
+        self.assertEqual(entry["owner_next_offset"], 5)
+        self.assertTrue(all(owner["owner_type"] == "maps_to" for owner in entry["owners"]))
+
+        second_page = self.index.review_changes("alpha", path="src/auth.py", owner_offset=5)
+        self.assertTrue(second_page["ok"], second_page)
+        second_entry = second_page["entries"][0]
+        self.assertEqual(len(second_entry["owners"]), 2)
+        self.assertTrue(second_entry["owner_complete"])
+        self.assertTrue(all(owner["direction"] == "Concept → File" for owner in second_entry["owners"]))
+
+        refreshed = self.index.refresh("alpha", "src")
+        self.assertTrue(refreshed["ok"], refreshed)
+        omitted = self.index.review_changes("alpha", include_unchanged=False)
+        self.assertEqual(omitted["entries"], [])
+        visible = self.index.review_changes("alpha", include_unchanged=True)
+        self.assertEqual(visible["entries"][0]["status"], "no_evidence")
+
     def test_refresh_file_deletion_cascades_edges_but_keeps_historical_evidence(self) -> None:
         token = self.token()
         file_id = self.file_id("alpha")
@@ -786,6 +897,44 @@ class SemanticMapTests(unittest.TestCase):
         self.assertEqual(version, 4)
         self.assertNotIn("map_revision", project_columns)
 
+    def test_schema_v6_adds_nullable_capture_metadata_without_fabricating_baselines(self) -> None:
+        token = self.token()
+        saved = self.index.update_map(
+            "alpha",
+            upsert_nodes=[self.semantic_node(
+                "concept:v6-capture", "Concept", "Version six capture", state="confirmed",
+                evidence=[{"path": "src/auth.py", "version_token": token}],
+            )],
+        )
+        self.assertTrue(saved["ok"], saved)
+        secret_before = self.store.version_secret()
+        connection = sqlite3.connect(self.store.path)
+        try:
+            connection.execute("DROP INDEX node_evidence_file_path")
+            connection.execute("DROP INDEX edge_evidence_file_path")
+            for table in ("node_evidence", "edge_evidence"):
+                connection.execute(f"ALTER TABLE {table} DROP COLUMN captured_size")
+                connection.execute(f"ALTER TABLE {table} DROP COLUMN captured_mtime_ns")
+            connection.execute("UPDATE schema_meta SET schema_version=6 WHERE singleton=1")
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated_store = IndexStore(self.base / "service-data")
+        migrated_store.register_project("alpha", self.root_a)
+        migrated = ProjectIndex({"alpha": self.projects["alpha"]}, migrated_store)
+        self.assertEqual(migrated_store.version_secret(), secret_before)
+        with migrated_store._connection() as connection:
+            self.assertEqual(connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 7)
+            row = connection.execute(
+                "SELECT captured_mtime_ns,captured_size FROM node_evidence "
+                "WHERE project_id='alpha' AND node_id='concept:v6-capture'"
+            ).fetchone()
+        self.assertIsNone(row["captured_mtime_ns"])
+        self.assertIsNone(row["captured_size"])
+        context = migrated.context("alpha", "concept:v6-capture")
+        self.assertEqual(context["node_freshness"]["status"], "fresh")
+
     def test_schema_v4_migrates_roles_and_revision_without_losing_graph_or_version_secret(self) -> None:
         token = self.token()
         file_id = self.file_id("alpha")
@@ -837,7 +986,7 @@ class SemanticMapTests(unittest.TestCase):
         )
         self.assertTrue(accepted["ok"], accepted)
         with migrated_store._connection() as connection:
-            self.assertEqual(connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 7)
             self.assertIsNotNone(connection.execute(
                 "SELECT map_revision FROM projects WHERE project_id='alpha'"
             ).fetchone())
@@ -913,7 +1062,7 @@ class SemanticMapTests(unittest.TestCase):
         self.assertEqual(manifest["entries"][0]["path"], "old.txt")
         self.assertTrue(manifest["entries"][0]["node_id"].startswith("file:"))
         with migrated._connection() as check:
-            self.assertEqual(check.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 6)
+            self.assertEqual(check.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 7)
             self.assertEqual(check.execute("SELECT COUNT(*) FROM map_edges WHERE relation='contains' AND managed=1").fetchone()[0], 1)
         again = IndexStore(data)
         self.assertEqual(again.list_files("legacy")["total"], 1)
@@ -985,7 +1134,7 @@ class SemanticMapTests(unittest.TestCase):
         context = ProjectIndex({"legacy": project}, migrated).context("legacy", "concept:legacy-evidence")
         self.assertTrue(context["ok"], context)
         with migrated._connection() as connection:
-            self.assertEqual(connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT schema_version FROM schema_meta").fetchone()[0], 7)
             self.assertEqual(
                 connection.execute(
                     "SELECT file_path FROM node_evidence WHERE node_id='concept:legacy-evidence'"

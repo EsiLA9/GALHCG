@@ -14,7 +14,7 @@ from typing import Iterable
 from project_preview.map_ids import file_node_id, managed_edge_id, project_node_id
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_PROJECT_ID_LENGTH = 64
 MAX_ERROR_MESSAGE_LENGTH = 2_000
 DEFAULT_LIST_LIMIT = 100
@@ -205,6 +205,14 @@ class IndexStore:
                     self._migrate_to_v6(connection)
                     connection.execute(
                         "UPDATE schema_meta SET schema_version = 6 WHERE singleton = 1"
+                    )
+                    connection.commit()
+                    version = 6
+                if version < 7:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._migrate_to_v7(connection)
+                    connection.execute(
+                        "UPDATE schema_meta SET schema_version = 7 WHERE singleton = 1"
                     )
                     connection.commit()
         except StoreError:
@@ -425,6 +433,19 @@ class IndexStore:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS edge_freshness_project_status ON edge_freshness(project_id, status, observed_at)"
         )
+
+    @staticmethod
+    def _migrate_to_v7(connection: sqlite3.Connection) -> None:
+        """Store the file metadata captured alongside each semantic evidence token."""
+        for table in ("node_evidence", "edge_evidence"):
+            columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if "captured_mtime_ns" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN captured_mtime_ns INTEGER")
+            if "captured_size" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN captured_size INTEGER")
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS {table}_file_path ON {table}(project_id, file_path)"
+            )
 
     @staticmethod
     def _insert_auto_edge(

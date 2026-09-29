@@ -6,6 +6,7 @@ import hmac
 import json
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from collections import defaultdict, deque
@@ -33,6 +34,10 @@ MAX_CONTEXT_EVIDENCE = 20
 MAX_FRESHNESS_FILES = 20
 MAX_FRESHNESS_BYTES = 256 * 1024 * 1024
 MAX_FRESHNESS_SECONDS = 15.0
+MAX_CHANGE_PAGE_FILES = 20
+MAX_CHANGE_OWNER_PAGE = 5
+MAX_CHANGE_BYTES = 256 * 1024 * 1024
+MAX_CHANGE_SECONDS = 15.0
 MAX_MAP_SEARCH_LIMIT = 100
 MAX_MAP_SEARCH_OFFSET = (1 << 63) - 1
 MAX_MAP_OUTPUT_BYTES = 48_000
@@ -213,10 +218,10 @@ class SemanticMap:
         project: ProjectFiles,
         secret: bytes,
         raw_items: list[Any],
-        cache: dict[str, tuple[str, int]],
+        cache: dict[str, tuple[str, int, int | None, int | None]],
         budget: dict[str, Any],
-    ) -> list[dict[str, str]]:
-        prepared: list[dict[str, str]] = []
+    ) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
         for raw in raw_items:
             if not isinstance(raw, dict) or set(raw) != {"path", "version_token"}:
@@ -258,7 +263,7 @@ class SemanticMap:
                         f"无法校验文件依据 {canonical}（{current.reason or 'unavailable'}）；整批未写入。",
                         stale_files=[canonical],
                     )
-                cached = (current.token, current.bytes_hashed)
+                cached = (current.token, current.bytes_hashed, current.mtime_ns, current.size)
                 cache[canonical] = cached
             if not hmac.compare_digest(cached[0], token):
                 raise MapFailure(
@@ -266,7 +271,12 @@ class SemanticMap:
                     f"文件自读取后已变化，需重新预览：{canonical}",
                     stale_files=[canonical],
                 )
-            prepared.append({"path": canonical, "version_token": token})
+            prepared.append({
+                "path": canonical,
+                "version_token": token,
+                "captured_mtime_ns": cached[2],
+                "captured_size": cached[3],
+            })
         return prepared
 
     @staticmethod
@@ -280,16 +290,20 @@ class SemanticMap:
         )
 
     @staticmethod
-    def _insert_evidence(connection, project_id: str, owner_id: str, evidence: list[dict[str, str]], *, edge: bool) -> None:
+    def _insert_evidence(connection, project_id: str, owner_id: str, evidence: list[dict[str, Any]], *, edge: bool) -> None:
         if edge:
             connection.executemany(
-                "INSERT INTO edge_evidence(project_id, edge_id, file_path, version_token, created_at) VALUES (?, ?, ?, ?, ?)",
-                ((project_id, owner_id, item["path"], item["version_token"], utc_now()) for item in evidence),
+                "INSERT INTO edge_evidence(project_id, edge_id, file_path, version_token, created_at, captured_mtime_ns, captured_size) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ((project_id, owner_id, item["path"], item["version_token"], utc_now(),
+                  item.get("captured_mtime_ns"), item.get("captured_size")) for item in evidence),
             )
         else:
             connection.executemany(
-                "INSERT INTO node_evidence(project_id, node_id, file_path, version_token, created_at) VALUES (?, ?, ?, ?, ?)",
-                ((project_id, owner_id, item["path"], item["version_token"], utc_now()) for item in evidence),
+                "INSERT INTO node_evidence(project_id, node_id, file_path, version_token, created_at, captured_mtime_ns, captured_size) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ((project_id, owner_id, item["path"], item["version_token"], utc_now(),
+                  item.get("captured_mtime_ns"), item.get("captured_size")) for item in evidence),
             )
 
     @staticmethod
@@ -596,7 +610,7 @@ class SemanticMap:
 
             prepared_nodes: list[dict[str, Any]] = []
             prepared_edges: list[dict[str, Any]] = []
-            version_cache: dict[str, tuple[str, int]] = {}
+            version_cache: dict[str, tuple[str, int, int | None, int | None]] = {}
             secret = self.store.version_secret()
             with self.store.transaction(immediate=True) as connection:
                 # Validate all file-version claims before changing the transaction's map rows.
@@ -723,7 +737,7 @@ class SemanticMap:
                 self._check_contains_cycles(connection, project_id)
                 if time.monotonic() - budget["started"] > budget["limit_seconds"]:
                     raise MapFailure("version_budget", "update_map 超过总时间预算；整批未写入。")
-                for path, (expected_token, _initial_bytes) in version_cache.items():
+                for path, (expected_token, _initial_bytes, _initial_mtime, _initial_size) in list(version_cache.items()):
                     current = project.compute_version_token(
                         path, project_id, secret,
                         max_seconds=max(0.01, min(5.0, budget["limit_seconds"] - (time.monotonic() - budget["started"]))),
@@ -733,6 +747,13 @@ class SemanticMap:
                         raise MapFailure("version_budget", "提交前的文件版本复核超过预算；整批未写入。")
                     if not current.token or not hmac.compare_digest(current.token, expected_token):
                         raise MapFailure("stale_evidence", f"文件在更新提交期间发生变化：{path}", stale_files=[path])
+                    version_cache[path] = (expected_token, current.bytes_hashed, current.mtime_ns, current.size)
+
+                for owner in [*prepared_nodes, *prepared_edges]:
+                    for item in owner["evidence"]:
+                        _token, _bytes, captured_mtime_ns, captured_size = version_cache[item["path"]]
+                        item["captured_mtime_ns"] = captured_mtime_ns
+                        item["captured_size"] = captured_size
 
                 if dry_run:
                     unique_paths = {
@@ -1041,6 +1062,391 @@ class SemanticMap:
                         "time_limit_ms": int(MAX_FRESHNESS_SECONDS * 1000),
                     },
                 }
+        except (StoreError, sqlite3.Error) as exc:
+            return {"ok": False, "error": "map_store_error", "message": str(exc), "project_id": project_id}
+
+    @staticmethod
+    def _change_owners(
+        connection: sqlite3.Connection,
+        project_id: str,
+        path: str,
+        *,
+        offset: int,
+        limit: int,
+        current_token: str | None,
+        current_reason: str | None,
+        current_mtime_ns: int | None,
+        current_size: int | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = connection.execute(
+            "WITH owners AS ("
+            "SELECT 'node' AS kind, n.node_id AS owner_id, n.name AS owner_name, n.type AS node_type, "
+            "NULL AS relation, NULL AS source_id, NULL AS source_name, NULL AS target_id, NULL AS target_name, "
+            "NULL AS roles_json, e.created_at, e.captured_mtime_ns, e.captured_size, e.version_token "
+            "FROM node_evidence e JOIN map_nodes n ON n.project_id=e.project_id AND n.node_id=e.node_id "
+            "WHERE e.project_id=? AND e.file_path=? "
+            "UNION ALL "
+            "SELECT 'edge', e.edge_id, s.name || ' → ' || t.name, s.type, m.relation, m.source_id, s.name, "
+            "m.target_id, t.name, m.roles_json, e.created_at, e.captured_mtime_ns, e.captured_size, e.version_token "
+            "FROM edge_evidence e JOIN map_edges m ON m.project_id=e.project_id AND m.edge_id=e.edge_id "
+            "JOIN map_nodes s ON s.project_id=m.project_id AND s.node_id=m.source_id "
+            "JOIN map_nodes t ON t.project_id=m.project_id AND t.node_id=m.target_id "
+            "WHERE e.project_id=? AND e.file_path=? "
+            "UNION ALL "
+            "SELECT 'maps_to', m.edge_id, s.name, s.type, m.relation, m.source_id, s.name, m.target_id, "
+            "t.name, m.roles_json, NULL, NULL, NULL, NULL "
+            "FROM map_edges m JOIN map_nodes s ON s.project_id=m.project_id AND s.node_id=m.source_id "
+            "JOIN map_nodes t ON t.project_id=m.project_id AND t.node_id=m.target_id "
+            "WHERE m.project_id=? AND m.relation='maps_to' AND t.type='File' AND t.path=?"
+            ") SELECT *, COUNT(*) OVER() AS owner_total FROM owners "
+            "ORDER BY CASE kind WHEN 'node' THEN 0 WHEN 'edge' THEN 1 ELSE 2 END, owner_name, owner_id "
+            "LIMIT ? OFFSET ?",
+            (project_id, path, project_id, path, project_id, path, limit, offset),
+        ).fetchall()
+        if rows:
+            total = int(rows[0]["owner_total"])
+        else:
+            total = int(connection.execute(
+                "SELECT (SELECT COUNT(*) FROM node_evidence WHERE project_id=? AND file_path=?) + "
+                "(SELECT COUNT(*) FROM edge_evidence WHERE project_id=? AND file_path=?) + "
+                "(SELECT COUNT(*) FROM map_edges m JOIN map_nodes t ON t.project_id=m.project_id AND t.node_id=m.target_id "
+                "WHERE m.project_id=? AND m.relation='maps_to' AND t.type='File' AND t.path=?)",
+                (project_id, path, project_id, path, project_id, path),
+            ).fetchone()[0])
+
+        owners: list[dict[str, Any]] = []
+        for row in rows:
+            kind = row["kind"]
+            owner: dict[str, Any] = {
+                "owner_type": kind,
+                "owner_id": row["owner_id"],
+                "name": row["owner_name"],
+                "node_type": row["node_type"],
+            }
+            if kind == "maps_to":
+                owner.update({
+                    "status": "navigation_only",
+                    "relation": "maps_to",
+                    "source_id": row["source_id"],
+                    "source_name": row["source_name"],
+                    "target_id": row["target_id"],
+                    "target_name": row["target_name"],
+                    "direction": "Concept → File",
+                    "roles": json.loads(row["roles_json"] or '["unspecified"]'),
+                })
+            else:
+                if current_token is None:
+                    status = "missing" if current_reason == "not_found" else "unknown"
+                else:
+                    if not hmac.compare_digest(row["version_token"], current_token):
+                        status = "content_changed"
+                    elif row["captured_mtime_ns"] is not None and (
+                        row["captured_mtime_ns"] != current_mtime_ns
+                        or (row["captured_size"] is not None and row["captured_size"] != current_size)
+                    ):
+                        status = "metadata_only"
+                    else:
+                        status = "unchanged"
+                owner.update({
+                    "status": status,
+                    "relation": row["relation"],
+                    "direction": "Concept → File" if row["relation"] == "maps_to" else "source → target",
+                    "source_id": row["source_id"],
+                    "source_name": row["source_name"],
+                    "target_id": row["target_id"],
+                    "target_name": row["target_name"],
+                    "evidence_created_at": row["created_at"],
+                    "captured_mtime_ns": row["captured_mtime_ns"],
+                    "captured_size": row["captured_size"],
+                    "time_baseline_available": row["captured_mtime_ns"] is not None,
+                })
+                if current_token is None:
+                    owner["reason"] = current_reason
+            owners.append(owner)
+        return owners, total
+
+    def review_changes(
+        self,
+        project_id: str,
+        *,
+        directory: str = "",
+        path: str = "",
+        limit: int = 20,
+        offset: int = 0,
+        owner_offset: int = 0,
+        owner_limit: int = 5,
+        include_unchanged: bool = False,
+    ) -> dict[str, Any]:
+        """Read-only, bounded content-version check for directly referenced files."""
+        if project_id not in self.projects:
+            return {"ok": False, "error": "unknown_project", "message": f"未配置 project_id：{project_id}", "project_id": project_id}
+        if (type(limit) is not int or limit < 1 or type(offset) is not int
+                or offset < 0 or offset > MAX_MAP_SEARCH_OFFSET):
+            return {"ok": False, "error": "invalid_input", "message": "limit 必须为正整数，offset 必须为非负整数。", "project_id": project_id}
+        if (type(owner_offset) is not int or owner_offset < 0 or owner_offset > MAX_MAP_SEARCH_OFFSET
+                or type(owner_limit) is not int or owner_limit < 1):
+            return {"ok": False, "error": "invalid_input", "message": "owner_offset 必须为非负整数，owner_limit 必须为正整数。", "project_id": project_id}
+        if type(include_unchanged) is not bool:
+            return {"ok": False, "error": "invalid_input", "message": "include_unchanged 必须为布尔值。", "project_id": project_id}
+        if path and directory:
+            return {"ok": False, "error": "invalid_input", "message": "path 与 directory 不能同时指定。", "project_id": project_id}
+        effective_limit = min(limit, MAX_CHANGE_PAGE_FILES)
+        effective_owner_limit = min(owner_limit, MAX_CHANGE_OWNER_PAGE)
+        project = self.projects[project_id]
+        try:
+            normalized_directory = project._normalise_relative(directory, allow_root=True) if directory else ""
+            normalized_path = project._normalise_relative(path, allow_root=False) if path else ""
+        except ToolFailure as exc:
+            return project._failure(exc)
+
+        started = time.monotonic()
+        work = {"bytes_hashed": 0, "files_checked": 0, "stop_reason": None}
+        try:
+            secret = self.store.version_secret()
+            with self.store._connection() as connection:
+                sources = (
+                    "SELECT file_path AS path FROM node_evidence WHERE project_id=? "
+                    "UNION SELECT file_path AS path FROM edge_evidence WHERE project_id=? "
+                    "UNION SELECT t.path AS path FROM map_edges m "
+                    "JOIN map_nodes t ON t.project_id=m.project_id AND t.node_id=m.target_id "
+                    "WHERE m.project_id=? AND m.relation='maps_to' AND t.type='File'"
+                )
+                filter_sql = ""
+                params: list[Any] = [project_id, project_id, project_id]
+                if normalized_path:
+                    filter_sql = " WHERE path=?"
+                    params.append(normalized_path)
+                elif normalized_directory:
+                    prefix = normalized_directory + "/"
+                    filter_sql = " WHERE path=? OR substr(path,1,?)=?"
+                    params.extend([normalized_directory, len(prefix), prefix])
+                total = int(connection.execute(
+                    f"SELECT COUNT(*) FROM (SELECT path FROM ({sources}) {filter_sql} GROUP BY path)", params
+                ).fetchone()[0])
+                paths = [row["path"] for row in connection.execute(
+                    f"SELECT path FROM ({sources}) {filter_sql} GROUP BY path ORDER BY path LIMIT ? OFFSET ?",
+                    [*params, effective_limit, offset],
+                ).fetchall()]
+                if normalized_path and total == 0:
+                    return {"ok": False, "error": "unreferenced_path", "message": "该文件没有直接 Evidence 或 maps_to 关联。", "project_id": project_id, "path": normalized_path}
+
+                entries: list[dict[str, Any]] = []
+                consumed = 0
+                for candidate_path in paths:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= MAX_CHANGE_SECONDS:
+                        work["stop_reason"] = "time_budget"
+                        break
+                    evidence_counts = connection.execute(
+                        "SELECT (SELECT COUNT(*) FROM node_evidence WHERE project_id=? AND file_path=?) AS nodes, "
+                        "(SELECT COUNT(*) FROM edge_evidence WHERE project_id=? AND file_path=?) AS edges",
+                        (project_id, candidate_path, project_id, candidate_path),
+                    ).fetchone()
+                    evidence_total = int(evidence_counts["nodes"] + evidence_counts["edges"])
+                    mapping_total = int(connection.execute(
+                        "SELECT COUNT(*) FROM map_edges m JOIN map_nodes t "
+                        "ON t.project_id=m.project_id AND t.node_id=m.target_id "
+                        "WHERE m.project_id=? AND m.relation='maps_to' AND t.type='File' AND t.path=?",
+                        (project_id, candidate_path),
+                    ).fetchone()[0])
+
+                    current = None
+                    current_mtime_ns = None
+                    current_size = None
+                    manifest = connection.execute(
+                        "SELECT mtime_ns,size,indexed_at FROM files WHERE project_id=? AND path=? AND type='file'",
+                        (project_id, candidate_path),
+                    ).fetchone()
+                    try:
+                        _canonical, disk_path = project._path_for(candidate_path)
+                        info = disk_path.lstat()
+                        if project._is_reparse_or_symlink(info, disk_path) or not stat.S_ISREG(info.st_mode):
+                            raise ToolFailure("not_regular_file", "目标不是允许读取的普通文件。")
+                        current_mtime_ns = int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)))
+                        current_size = int(info.st_size)
+                    except ToolFailure as exc:
+                        current = {"token": None, "reason": exc.code}
+                    except OSError:
+                        current = {"token": None, "reason": "unavailable"}
+
+                    if evidence_total and current is None:
+                        remaining_bytes = MAX_CHANGE_BYTES - work["bytes_hashed"]
+                        if current_size * 2 > remaining_bytes:
+                            current = {"token": None, "reason": "byte_budget"}
+                            work["stop_reason"] = "byte_budget"
+                        else:
+                            remaining_seconds = MAX_CHANGE_SECONDS - (time.monotonic() - started)
+                            if remaining_seconds <= 0:
+                                work["stop_reason"] = "time_budget"
+                                break
+                            version = project.compute_version_token(
+                                candidate_path, project_id, secret, verify_twice=True,
+                                max_seconds=min(5.0, remaining_seconds),
+                            )
+                            work["bytes_hashed"] += version.bytes_hashed
+                            current = {"token": version.token, "reason": version.reason}
+                            if version.mtime_ns is not None:
+                                current_mtime_ns = version.mtime_ns
+                            if version.size is not None:
+                                current_size = version.size
+                            if not version.token and version.reason in {"hash_timeout", "file_too_large"}:
+                                work["stop_reason"] = "time_budget" if version.reason == "hash_timeout" else "file_budget"
+                    work["files_checked"] += 1
+
+                    if evidence_total:
+                        if current and current.get("token"):
+                            stale_count = int(connection.execute(
+                                "SELECT COUNT(*) FROM (SELECT version_token FROM node_evidence WHERE project_id=? AND file_path=? "
+                                "UNION ALL SELECT version_token FROM edge_evidence WHERE project_id=? AND file_path=?) "
+                                "WHERE version_token<>?",
+                                (project_id, candidate_path, project_id, candidate_path, current["token"]),
+                            ).fetchone()[0])
+                            metadata_diff_count = int(connection.execute(
+                                "SELECT COUNT(*) FROM (SELECT version_token,captured_mtime_ns,captured_size FROM node_evidence "
+                                "WHERE project_id=? AND file_path=? UNION ALL SELECT version_token,captured_mtime_ns,captured_size "
+                                "FROM edge_evidence WHERE project_id=? AND file_path=?) WHERE version_token=? AND "
+                                "((captured_mtime_ns IS NOT NULL AND captured_mtime_ns<>?) OR "
+                                "(captured_size IS NOT NULL AND captured_size<>?))",
+                                (project_id, candidate_path, project_id, candidate_path,
+                                 current["token"], current_mtime_ns, current_size),
+                            ).fetchone()[0])
+                            baseline_missing = int(connection.execute(
+                                "SELECT COUNT(*) FROM (SELECT captured_mtime_ns,captured_size FROM node_evidence "
+                                "WHERE project_id=? AND file_path=? UNION ALL SELECT captured_mtime_ns,captured_size "
+                                "FROM edge_evidence WHERE project_id=? AND file_path=?) "
+                                "WHERE captured_mtime_ns IS NULL OR captured_size IS NULL",
+                                (project_id, candidate_path, project_id, candidate_path),
+                            ).fetchone()[0])
+                            if stale_count:
+                                status, reason = "content_changed", "content_changed"
+                            elif metadata_diff_count:
+                                status, reason = "metadata_only", "metadata_changed"
+                            else:
+                                status, reason = "unchanged", None
+                            if current_mtime_ns is None:
+                                status, reason = "unknown", current.get("reason") or "metadata_unavailable"
+                        else:
+                            reason = (current or {}).get("reason") or "unavailable"
+                            status = "missing" if reason == "not_found" else "unknown"
+                            stale_count = 0
+                            metadata_diff_count = 0
+                            baseline_missing = evidence_total
+                    else:
+                        stale_count = 0
+                        metadata_diff_count = 0
+                        baseline_missing = 0
+                        if current_mtime_ns is None:
+                            reason = (current or {}).get("reason") or "not_found"
+                            status = "missing" if reason == "not_found" else "unknown"
+                        elif manifest is None or manifest["mtime_ns"] is None:
+                            status, reason = "no_evidence", "no_content_baseline"
+                        elif current_mtime_ns != manifest["mtime_ns"] or current_size != manifest["size"]:
+                            status, reason = "metadata_since_refresh", "no_content_baseline"
+                        else:
+                            status, reason = "no_evidence", "no_content_baseline"
+
+                    owners, owner_total = self._change_owners(
+                        connection, project_id, candidate_path,
+                        offset=owner_offset if normalized_path else 0,
+                        limit=effective_owner_limit,
+                        current_token=current.get("token") if current else None,
+                        current_reason=current.get("reason") if current else None,
+                        current_mtime_ns=current_mtime_ns,
+                        current_size=current_size,
+                    )
+                    needs_attention = status not in {"unchanged", "no_evidence"}
+                    consumed += 1
+                    if include_unchanged or needs_attention or normalized_path:
+                        entries.append({
+                            "path": candidate_path,
+                            "status": status,
+                            "reason": reason,
+                            "current_mtime_ns": current_mtime_ns,
+                            "current_size": current_size,
+                            "manifest_mtime_ns": manifest["mtime_ns"] if manifest else None,
+                            "manifest_indexed_at": manifest["indexed_at"] if manifest else None,
+                            "evidence_reference_count": evidence_total,
+                            "stale_evidence_reference_count": stale_count,
+                            "metadata_changed_reference_count": metadata_diff_count,
+                            "time_baseline_missing_count": baseline_missing,
+                            "maps_to_count": mapping_total,
+                            "owner_total": owner_total,
+                            "owners": owners,
+                            "owner_offset": owner_offset if normalized_path else 0,
+                            "owner_limit": effective_owner_limit,
+                            "owner_next_offset": (owner_offset if normalized_path else 0) + len(owners)
+                            if (owner_offset if normalized_path else 0) + len(owners) < owner_total else None,
+                            "owner_complete": (owner_offset if normalized_path else 0) + len(owners) >= owner_total,
+                            "needs_attention": needs_attention,
+                            "_candidate_offset": offset + consumed - 1,
+                        })
+                    if work["stop_reason"]:
+                        break
+
+                if normalized_path:
+                    next_offset = None
+                    complete = work["stop_reason"] is None
+                    page_total = 1
+                else:
+                    next_offset = offset + consumed if offset + consumed < total else None
+                    complete = next_offset is None and work["stop_reason"] is None
+                response: dict[str, Any] = {
+                    "ok": True,
+                    "project_id": project_id,
+                    "scope": normalized_directory or ".",
+                    "path": normalized_path or None,
+                    "checked_at": utc_now(),
+                    "read_only": True,
+                    "include_unchanged": include_unchanged,
+                    "limit": effective_limit,
+                    "offset": offset,
+                    "total_paths": total,
+                    "checked_paths": consumed,
+                    "returned_paths": len(entries),
+                    "entries": entries,
+                    "next_offset": next_offset,
+                    "complete": complete,
+                    "stop_reason": work["stop_reason"],
+                    "owner_limit": effective_owner_limit,
+                    "owner_offset": owner_offset,
+                    "work": {
+                        "files_checked": work["files_checked"],
+                        "bytes_hashed": work["bytes_hashed"],
+                        "byte_limit": MAX_CHANGE_BYTES,
+                        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+                        "time_limit_ms": int(MAX_CHANGE_SECONDS * 1000),
+                    },
+                    "counts": {
+                        "needs_attention": sum(item["needs_attention"] for item in entries),
+                        "unchanged_returned": sum(item["status"] == "unchanged" for item in entries),
+                        "metadata_since_refresh": sum(item["status"] == "metadata_since_refresh" for item in entries),
+                    },
+                }
+                if normalized_path and entries and _json_size(response) > MAX_MAP_OUTPUT_BYTES:
+                    response["output_limited"] = True
+                    response["complete"] = False
+                    response["stop_reason"] = "output_budget"
+                    while entries[0]["owners"] and _json_size(response) > MAX_MAP_OUTPUT_BYTES:
+                        entries[0]["owners"].pop()
+                        entries[0]["owner_next_offset"] = owner_offset + len(entries[0]["owners"])
+                        entries[0]["owner_complete"] = False
+                while not normalized_path and entries and _json_size(response) > MAX_MAP_OUTPUT_BYTES:
+                    removed = entries.pop()
+                    response["returned_paths"] = len(entries)
+                    response["output_limited"] = True
+                    response["complete"] = False
+                    response["stop_reason"] = "output_budget"
+                    response["checked_paths"] = removed["_candidate_offset"] - offset
+                    response["next_offset"] = removed["_candidate_offset"]
+                for item in entries:
+                    item.pop("_candidate_offset", None)
+                response["counts"] = {
+                    "needs_attention": sum(item["needs_attention"] for item in entries),
+                    "unchanged_returned": sum(item["status"] == "unchanged" for item in entries),
+                    "metadata_since_refresh": sum(item["status"] == "metadata_since_refresh" for item in entries),
+                }
+                response.setdefault("output_limited", False)
+                return response
         except (StoreError, sqlite3.Error) as exc:
             return {"ok": False, "error": "map_store_error", "message": str(exc), "project_id": project_id}
 
@@ -1524,6 +1930,24 @@ class SemanticMap:
                 semantic_edge_count = connection.execute(
                     "SELECT COUNT(*) FROM map_edges WHERE project_id = ? AND managed = 0", (project_id,)
                 ).fetchone()[0]
+                relation_counts = {relation: 0 for relation in RELATION_TYPES}
+                relation_counts.update({
+                    row["relation"]: row["count"]
+                    for row in connection.execute(
+                        "SELECT relation, COUNT(*) AS count FROM map_edges "
+                        "WHERE project_id = ? AND managed = 0 GROUP BY relation",
+                        (project_id,),
+                    )
+                })
+                node_counts = {"Module": 0, "Concept": 0}
+                node_counts.update({
+                    row["type"]: row["count"]
+                    for row in connection.execute(
+                        "SELECT type, COUNT(*) AS count FROM map_nodes "
+                        "WHERE project_id = ? AND type IN ('Module', 'Concept') GROUP BY type",
+                        (project_id,),
+                    )
+                })
                 freshness_counts = connection.execute(
                     "SELECT (SELECT COUNT(*) FROM map_nodes WHERE project_id = ? AND type IN ('Module','Concept')) + "
                     "(SELECT COUNT(*) FROM map_edges WHERE project_id = ? AND managed = 0) AS owner_count, "
@@ -1549,6 +1973,8 @@ class SemanticMap:
                         "unassociated_file_count": max(0, file_count - len(associated_paths)),
                         "semantic_node_count": semantic_node_count,
                         "semantic_edge_count": semantic_edge_count,
+                        "node_counts": node_counts,
+                        "relation_counts": relation_counts,
                         "freshness": {
                             "known_stale_owner_count": freshness_counts["stale_count"],
                             "last_observed_fresh_owner_count": freshness_counts["fresh_count"],

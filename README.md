@@ -1,6 +1,6 @@
 # 项目预览 MCP
 
-一个本地 MCP 服务与语义审阅界面，让 Coding Agent 和用户浏览、搜索、预览本地项目，维护 SQLite 文件清单与轻量语义地图。MCP 工具包括 `browse`、`preview`、`search`、`refresh`、`refresh_history`、`status`、`list_files`、`resolve_paths`、`update_map`、`context` 和 `traverse`。索引只保存文件元数据、运行记录、简短语义条目和版本凭据，不保存源码正文；MCP 浏览与刷新不会修改目标文件，显式导出命令可在目标项目内生成报告。
+一个本地 MCP 服务与语义审阅界面，让 Coding Agent 和用户浏览、搜索、预览本地项目，维护 SQLite 文件清单与轻量语义地图。MCP 工具包括 `resolve_project`、`browse`、`preview`、`search`、`refresh`、`refresh_history`、`status`、`review_changes`、`verify_freshness`、`list_files`、`resolve_paths`、`update_map`、`context` 和 `traverse`。索引只保存文件元数据、运行记录、简短语义条目和版本凭据，不保存源码正文；MCP 浏览与刷新不会修改目标文件，显式导出命令可在目标项目内生成报告。
 
 ## 环境与安装
 
@@ -30,9 +30,11 @@ python -m venv .venv
   --data-dir 'D:\codex-data\project-preview'
 ```
 
-界面只监听本机 loopback 地址并默认打开浏览器。关闭终端中的进程即可停止。可用 `--port` 指定端口，`--no-browser` 禁止自动打开浏览器。关系图支持调整节点间距，以及在完整换行和固定尺寸省略之间切换卡片文字模式。文件预览支持分页、当前文件搜索和尾部预览；若尾部行号无法在预算内确认，界面会明确标记。文件搜索依赖 ripgrep（`rg`）。
+界面只监听本机 loopback 地址并默认打开浏览器。启动后可用日志中的 `127.0.0.1` 地址，也可把主机名改为 `localhost` 并保留相同端口；两种地址都指向同一个本地服务。关闭终端中的进程即可停止。可用 `--port` 指定端口，`--no-browser` 禁止自动打开浏览器。中央图提供结构、关系和文件三种局部视图；关系视图可筛选边类型与方向，结构视图可展开两层。图栏支持调整节点间距，以及在完整换行和固定尺寸省略之间切换卡片文字模式。文件预览支持分页、当前文件搜索和尾部预览；若尾部行号无法在预算内确认，界面会明确标记。文件搜索依赖 ripgrep（`rg`）。
 
-点击“重新核验依据”会检查选中 Concept 的依据并更新数据库中该节点最近一次 freshness 观察；浏览、搜索、预览和打开文件不会修改语义地图。关系依据可在检查器中单独核验。界面不提供 `update_map` 或 `refresh` 操作。
+点击“扫描文件”可从本地项目重建文件清单；扫描遵循项目忽略规则，只更新 SQLite 中的文件元数据，不读取源码正文，也不修改项目文件。概念和关系属于语义地图，仍需通过 ChatGPT 的 `project-preview-mcp` 生成或更新。顶栏“文件变化”会只读核对直接引用文件的内容令牌，列出直接 Evidence owner 与 `maps_to` 导航关系；mtime 变化但内容令牌不变时只提示元数据变化，不判为语义过期。点击“重新核验依据”或变化项中的“重新核验并记录”会更新对应节点/关系最近一次 freshness 观察；只查看变化清单、浏览、搜索、预览和打开文件不会修改语义地图。界面不提供 `update_map` 操作。
+
+本地界面与 MCP 服务使用相同项目 ID、项目根目录和数据目录时，会看到同一份文件清单与语义地图。默认不需要设置环境变量：两边都省略 `--data-dir` 时会使用同一个当前用户数据目录。只有 MCP 客户端明确配置了自定义 `--data-dir` 时，启动界面才需要传入相同路径。项目 ID 用于选择已配置项目，不是登录或用户权限设置。若本地界面显示“尚无概念与关系”，先确认两边使用了同一组项目参数与数据目录，再判断数据库内容。
 
 调用“系统编辑器”时，默认使用操作系统的文件关联。也可通过 `--editor` 或 `VISUAL` / `EDITOR` 环境变量指定命令；命令以参数数组启动，不经过 shell。命令参数中的 `{path}` 会替换为已校验的项目内绝对路径；未写 `{path}` 时，服务会把路径作为最后一个参数追加。
 
@@ -171,7 +173,17 @@ macOS 和其他 Linux 发行版的安装方式见 [ripgrep 官方安装说明](h
 
 ## 工具
 
-在单项目模式下，`project_id` 可省略（`--root` 对应 ID `default`）。多项目模式下，凡是访问特定项目的工具都要求提供 `project_id`；`status` 可省略 ID 来汇总本次服务配置的项目。
+在单项目模式下，`project_id` 可省略（`--root` 对应 ID `default`）。多项目模式下，访问项目数据的工具都要求提供 `project_id`；`status` 可省略 ID 来汇总本次服务配置的项目。Agent 已知自己的工作目录时，可先用 `resolve_project` 将该绝对路径匹配到一个已配置项目，再把返回的 `project_id` 显式传给后续工具。该解析不会读取 MCP 客户端的当前目录，也不会保存隐式选中状态或注册新项目。
+
+### `resolve_project`
+
+将调用方显式传入的工作目录匹配到服务启动时通过 `--root` 或 `--project` 登记的项目根。路径必须存在且是绝对目录；工作目录可以等于项目根，也可以是其子目录。如果项目根嵌套配置，解析会选最深、最具体的根。它只返回项目 ID 和匹配信息，不改变服务配置或后续调用的项目选择。
+
+```json
+{"workspace_path":"D:\\work\\my-project\\src"}
+```
+
+成功结果包含 `project_id`、规范化的 `workspace_path`、匹配的 `root_path`、`match_type` 和 `selection_is_persistent: false`。后续每个项目操作仍须显式使用返回的 `project_id`。目录未登记时返回 `workspace_not_configured`；同根目录被不同 ID 重复登记时返回候选列表，要求调用方显式消歧。相对路径、不存在的路径和文件路径会分别返回输入错误。
 
 ### `browse`
 
@@ -209,7 +221,7 @@ macOS 和其他 Linux 发行版的安装方式见 [ripgrep 官方安装说明](h
 
 常见流程是先将 `browse` 返回的文件 `path` 传给 `preview`，再按 `next_start_line` 读取下一段。
 
-`preview` 还会返回不透明的 `version_token`、`version_token_status` 与 `version_token_reason`。对不超过 64 MiB、且快照在 5 秒预算内完成的文件，服务将同一份内存快照用于预览和生成令牌；令牌只对应实际预览所用的字节。快照内容最多 64 MiB，只保留在内存、不写入磁盘。超大、超时或在快照时检测到变化的文件仍可按原预算预览，但不会获得令牌。令牌用于 `update_map` 依据校验，调用方无需计算或暴露文件哈希。
+`preview` 还会返回不透明的 `version_token`、`version_token_status`、`version_token_reason`，以及令牌对应快照的 `source_mtime_ns` 和 `source_size`。对不超过 64 MiB、且快照在 5 秒预算内完成的文件，服务将同一份内存快照用于预览和生成令牌；令牌只对应实际预览所用的字节。快照内容最多 64 MiB，只保留在内存、不写入磁盘。超大、超时或在快照时检测到变化的文件仍可按原预算预览，但不会获得令牌。令牌用于 `update_map` 依据校验，调用方无需计算或暴露文件哈希。
 
 结果中的 `truncated`、`reason`、`next_start_line` 和 `continuation` 说明内容是否截断及如何继续。正常到达文件末尾时 `reason` 为 `file_end`，且没有下一行号。输出最多 48,000 UTF-8 字节；单行最多 8,192 字节；一次调用最多读取 1 MiB。超长行不会被伪装成完整行，也不支持拆分读取行内字节。读取预算不足以定位请求的行号时，结果会明确说明无法续读，因为原型没有行索引。
 
@@ -270,7 +282,39 @@ macOS 和其他 Linux 发行版的安装方式见 [ripgrep 官方安装说明](h
 
 ### `status`
 
-返回每个项目的根目录、文件清单、最近刷新情况及语义地图覆盖摘要。`semantic_map` 统计 `maps_to` 和当前清单内的已存依据路径，不计入服务自动生成的 Project→File 结构边；它表示建立过关联的范围，不代表理解准确率。`freshness` 统计每个 owner 最近一次 `context` 观察到的 stale、fresh、unknown 与未检查数量；这些观察可能已过时，`status` 不会全库哈希。根目录过长时，结果会设置 `root_truncated: true` 并附带 `root_fingerprint`；比较服务配置身份时应使用完整启动配置、项目 ID 与指纹，不要按截断前缀判断。多项目模式下省略 `project_id` 可汇总本次服务配置的项目；状态结果按项目 ID 排序并支持 `limit`、`offset` 翻页。输出受 48,000 字节上限约束。
+返回每个项目的根目录、文件清单、最近刷新情况及语义地图覆盖摘要。`semantic_map.node_counts` 和 `relation_counts` 分别统计 Module/Concept 节点及全部非自动管理的关系类型，`semantic_edge_count` 是这些关系总数。`contains` 可能包含 Module→File 归属边；`mapped_file_count` 统计 `maps_to` 关系涉及的不同文件数，不等于 `maps_to` 边数。当前已存依据与清单文件关联的覆盖统计不计入服务自动生成的 Project→File 结构边；它表示建立过关联的范围，不代表理解准确率。`freshness` 统计每个 owner 最近一次 `context` 观察到的 stale、fresh、unknown 与未检查数量；这些观察可能已过时，`status` 不会全库哈希。根目录过长时，结果会设置 `root_truncated: true` 并附带 `root_fingerprint`；比较服务配置身份时应使用完整启动配置、项目 ID 与指纹，不要按截断前缀判断。多项目模式下省略 `project_id` 可汇总本次服务配置的项目；状态结果按项目 ID 排序并支持 `limit`、`offset` 翻页。输出受 48,000 字节上限约束。
+
+### `review_changes`
+
+只读复核项目内有直接 Evidence 或 `maps_to` 关系的文件。它对 Evidence 文件当前内容计算版本令牌，并与每条节点/关系 Evidence 的令牌比较；查询不写 freshness、不刷新清单、不改语义图。mtime 和大小只作辅助线索，不能单独证明内容改变。
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `directory` | `""` | 限定项目内目录及其子目录；与 `path` 互斥 |
+| `path` | `""` | 精确复核单个已有关联的相对路径；可配合 `owner_offset` 续读直接 owner |
+| `limit` | `20` | 文件页大小，最大 `20` |
+| `offset` | `0` | 文件路径页偏移；始终使用响应的 `next_offset` |
+| `owner_offset` | `0` | 单文件直接关联 owner 页偏移，仅与 `path` 一起使用 |
+| `owner_limit` | `5` | 每文件最多返回 5 个直接关联项 |
+| `include_unchanged` | `false` | 是否也返回未变化和无 Evidence 的导航文件 |
+
+状态为 `content_changed`、`metadata_only`、`missing`、`unknown`、`metadata_since_refresh`、`unchanged` 或 `no_evidence`。旧 Evidence 仍可通过保存的 `version_token` 判断内容是否变化，但没有捕获时 mtime；这时会明确标出时间基线不可用。仅有 `maps_to` 的文件没有内容版本基线；若当前文件 mtime/大小与最近一次清单刷新不同，只报告“清单后有变化”候选，不宣称语义内容过期。完成 `refresh` 后，此清单差异会消失。
+
+邻接仅限该文件的直接 Evidence owner 与直接 `maps_to` Concept；不递归扩展 Concept 邻居。`maps_to` 始终按原方向 Concept→File 展示。每页最多检查 20 个文件，最多读取 256 MiB，最长 15 秒，响应正文最多 48,000 字节；结果含 `complete`、`stop_reason`、`next_offset`、owner 分页信息与实际工作量。默认不列出 unchanged，但它们仍计入 `checked_paths`。
+
+示例：
+
+```json
+{"project_id":"app","directory":"src","limit":10,"offset":0}
+```
+
+### `verify_freshness`
+
+显式重查一个语义节点或关系的 Evidence，并将最新结果写入派生 freshness 观察。它只写入该 owner 的核验状态，不改变 Concept、关系或 Evidence；查询清单时不会自动调用此工具。
+
+```json
+{"project_id":"app","owner_type":"node","owner_id":"concept:session-auth"}
+```
 
 ### `list_files`
 
@@ -375,14 +419,16 @@ macOS 和其他 Linux 发行版的安装方式见 [ripgrep 官方安装说明](h
 安装后可运行内置回归测试：
 
 ```powershell
+$env:PYTHONPATH = 'src'
 & .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-& .\.venv\Scripts\python.exe -m unittest tests.test_semantic_map tests.test_mcp_stdio -v
+& .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_semantic_map.py -v
+& .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_mcp_stdio.py -v
 & .\.venv\Scripts\python.exe verification\accept_stage1.py
 ```
 
-完整回归共运行 58 项：57 项通过，1 项 Windows 符号链接用例因缺少创建权限跳过；其中语义地图专项 21 项、SDK stdio MCP 测试 2 项。独立阶段 1 协议验收 11 项通过，2 项符号链接检查因相同权限跳过。回归还覆盖持久化、多项目隔离、工作目录绑定、清单分页、局部刷新、文件/目录类型变化、刷新历史统计和分页、失败原子性和未完成刷新状态。
+完整回归共运行 61 项：60 项通过，1 项 Windows 符号链接用例因缺少创建权限跳过；其中语义地图专项 24 项、SDK stdio MCP 测试 2 项。独立阶段 1 协议验收 11 项通过，2 项符号链接检查因相同权限跳过。回归还覆盖持久化、多项目隔离、工作目录绑定、清单分页、局部刷新、文件/目录类型变化、刷新历史统计和分页、失败原子性和未完成刷新状态。
 
-语义地图测试覆盖 schema v1–v6 迁移、早期 v2 证据表兼容和当前 v4 升级、重启持久化、节点/边新鲜度、批量原子性、概念多父结构、遍历游标与预算、文件角色导出、过期令牌、文件删除级联和输出预算；真实 SDK stdio 验收会调用 `update_map`、`context`、`search(mode="map")`、`resolve_paths` 和 `traverse`。
+语义地图测试覆盖 schema v1–v7 迁移、早期 v2 证据表兼容、v4/v6 升级、重启持久化、节点/边新鲜度、只读变化清单、捕获 mtime、直接邻接分页、批量原子性、概念多父结构、遍历游标与预算、文件角色导出、过期令牌和文件删除级联；真实 SDK stdio 验收会调用 `update_map`、`context`、`review_changes`、`verify_freshness`、`search(mode="map")`、`resolve_paths` 和 `traverse`。
 
 测试覆盖浏览与分页、路径与源码搜索、中文内容、忽略规则、路径边界、预算截断、文件错误、链接限制，以及通过官方 SDK 客户端进行的真实 stdio MCP 连接。
 

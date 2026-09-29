@@ -62,7 +62,7 @@ class ProjectIndexTests(unittest.TestCase):
             data = self.store.path.read_bytes()
         finally:
             connection.close()
-            self.assertEqual(schema, 6)
+            self.assertEqual(schema, 7)
         self.assertIn("files", tables)
         self.assertIn("map_nodes", tables)
         self.assertNotIn(b"A private body marker", data)

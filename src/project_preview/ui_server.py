@@ -81,12 +81,13 @@ def _handler_type(
             logger.info("%s - %s", self.client_address[0], fmt % args)
 
         def _origin_ok(self) -> bool:
-            expected_host = f"127.0.0.1:{self.server.server_port}"
-            expected_origin = f"http://{expected_host}"
-            if self.headers.get("Host") != expected_host:
+            port = self.server.server_port
+            host = (self.headers.get("Host") or "").lower()
+            allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if host not in allowed_hosts:
                 return False
             origin = self.headers.get("Origin")
-            return origin is None or origin == expected_origin
+            return origin is None or origin.lower() == f"http://{host}"
 
         def _send_bytes(self, payload: bytes, content_type: str, status: int = 200) -> None:
             self.send_response(status)
@@ -222,6 +223,19 @@ def _handler_type(
                     project_id, str(body.get("owner_type", "node")),
                     str(body.get("owner_id", "")),
                 )
+            if path == "/api/changes":
+                return index.review_changes(
+                    project_id,
+                    directory=str(body.get("directory", "")),
+                    path=str(body.get("path", "")),
+                    limit=body.get("limit", 10),
+                    offset=body.get("offset", 0),
+                    owner_offset=body.get("owner_offset", 0),
+                    owner_limit=body.get("owner_limit", 5),
+                    include_unchanged=body.get("include_unchanged", False),
+                )
+            if path == "/api/refresh":
+                return index.refresh(project_id, str(body.get("directory", "")))
             if path == "/api/list-files":
                 return index.list_files(
                     project_id, str(body.get("directory", "")),
@@ -264,6 +278,7 @@ def serve_local_ui(
     server.daemon_threads = True
     url = f"http://127.0.0.1:{server.server_port}/"
     logger.info("Local semantic review UI is available at %s", url)
+    logger.info("You can also open http://localhost:%s/", server.server_port)
     if open_browser:
         try:
             webbrowser.open(url, new=2)
